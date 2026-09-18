@@ -1,4 +1,4 @@
-"""Investment Analyzer V1 — free, rule-based equity research in Hebrew."""
+"""Investment Analyzer V1.1 — free, rule-based equity research in Hebrew."""
 from datetime import datetime, timezone
 import math
 import re
@@ -332,11 +332,192 @@ def observations(m):
     return simple, strengths, risks
 
 
+
+def price_scenario(metrics, change_pct):
+    """Sensitivity only: no forecast, target, or change to business results."""
+    factor = 1 + change_pct / 100
+    result = {"price": None, "pe": None, "forward_pe": None, "ps": None, "pb": None}
+    for key in result:
+        value = number(metrics.get(key))
+        if value is not None and value > 0:
+            result[key] = value * factor
+    return result
+
+
+def historical_investment(history, years, amount):
+    """Use adjusted closes and disclose the actual calendar baseline."""
+    series = history.get("Adj Close", pd.Series(dtype=float))
+    series = pd.to_numeric(series, errors="coerce").dropna().sort_index()
+    series = series[series > 0]
+    if series.empty:
+        return None
+    end = series.index[-1]
+    target = end - pd.DateOffset(years=int(years))
+    before = series.loc[:target]
+    if before.empty or (target - before.index[-1]).days > 7:
+        return None
+    start = before.index[-1]
+    path = series.loc[start:] / before.iloc[-1] * float(amount)
+    total_return = float(path.iloc[-1] / amount - 1)
+    annualized = float((1 + total_return) ** (365.25 / (end - start).days) - 1)
+    return dict(start=start, end=end, path=path, final=float(path.iloc[-1]),
+                profit=float(path.iloc[-1] - amount), total_return=total_return,
+                annualized=annualized)
+
+
+def contextual_explanation(label, value):
+    value = number(value)
+    if value is None:
+        return ""
+    if label in {"P/E", "Forward P/E"} and value > 0:
+        period = "השנתי המדווח" if label == "P/E" else "העתידי הצפוי"
+        return f"משלמים {value:,.2f} יחידות מחיר על כל יחידה של רווח {period} למניה."
+    if label == "Price / Sales" and value > 0:
+        return f"שווי החברה הוא פי {value:,.2f} מהכנסותיה השנתיות."
+    if label == "Price / Book":
+        return f"שווי השוק הוא פי {value:,.2f} מההון החשבונאי המדווח; הון שלילי מגביל את משמעות היחס."
+    if label in {"Gross Margin", "Operating Margin", "Profit Margin", "EBITDA Margin"}:
+        stage = {"Gross Margin": "לאחר עלות המוצר", "Operating Margin": "לאחר הוצאות התפעול",
+                 "Profit Margin": "בשורה התחתונה, לאחר כלל ההוצאות", "EBITDA Margin": "לפני ריבית, מסים, פחת והפחתות"}[label]
+        outcome = "רווח" if value >= 0 else "הפסד"
+        return f"מכל 100 יחידות הכנסה, נרשם {outcome} של {abs(value * 100):,.2f} יחידות {stage}."
+    if label in {"Revenue Growth", "Earnings Growth", "EPS Growth · שנתי"}:
+        subject = {"Revenue Growth": "ההכנסות", "Earnings Growth": "הרווחים", "EPS Growth · שנתי": "הרווח למניה"}[label]
+        verb = "עלה" if label.startswith("EPS") and value >= 0 else "ירד" if label.startswith("EPS") else "עלו" if value >= 0 else "ירדו"
+        period = "השנה הקודמת" if label.startswith("EPS") else "התקופה המקבילה"
+        return f"{subject} {verb} ב־{abs(value * 100):,.2f}% לעומת {period}, לפי הנתונים הזמינים."
+    if label == "Current Ratio":
+        return f"מול כל יחידה של התחייבויות שוטפות יש {value:,.2f} יחידות של נכסים שוטפים."
+    if label == "Debt / Equity · פעמים":
+        return f"מול כל יחידה של הון עצמי יש {value:,.2f} יחידות חוב."
+    if label in {"EPS · TTM", "Forward EPS"}:
+        period = "ב־12 החודשים האחרונים" if label == "EPS · TTM" else "לפי התחזית העתידית"
+        return f"{'רווח' if value >= 0 else 'הפסד'} של {abs(value):,.2f} לכל מניה {period}."
+    if label == "Free Cash Flow":
+        return f"{'נותר עודף' if value >= 0 else 'נוצר פער שלילי'} של {fmt(abs(value), 'money')} בין התזרים השוטף להשקעות בתקופה."
+    if label in {"ROE", "ROA"}:
+        denominator = "הון עצמי" if label == "ROE" else "נכסים"
+        return f"יחס הרווח ל{denominator} המדווח הוא {value * 100:,.2f} לכל 100. זהו יחס חשבונאי, לא תשואה על המניה."
+    return ""
+
+
+def export_report(data, model):
+    """Portable UTF-8 Markdown snapshot, no extra libraries or external calls."""
+    m, info = model["metrics"], data["info"]
+    def clean(value):
+        return str(value).replace("|", "/").replace("\n", " ").replace("\r", " ")
+    lines = [f"# Investment Analyzer — {data['symbol']}", "",
+             clean(info.get("longName") or info.get("shortName") or data["symbol"]), "",
+             f"שליפה (UTC): {data['fetched']}",
+             f"מטבע מסחר: {info.get('currency') or NA} | מטבע דוחות: {info.get('financialCurrency') or NA}",
+             "מקור: Yahoo Finance באמצעות yfinance. הנתונים עשויים להיות מושהים.", "",
+             "הדוח הוא צילום מצב של הנתונים שנשלפו, ואינו כולל תרחישים שהוזנו במחשבונים.", "",
+             "## מידע ונתונים", "", "| מדד | ערך |", "|---|---|"]
+    fields = [
+        ("price", "מחיר אחרון", "num"), ("daily", "שינוי יומי", "pct"),
+        ("market_cap", "שווי שוק", "money"), ("high", "שיא 52 שבועות", "num"),
+        ("low", "שפל 52 שבועות", "num"), ("distance", "מרחק מהשיא", "pct"),
+        ("pe", "P/E", "num"), ("forward_pe", "Forward P/E", "num"), ("peg", "PEG", "num"),
+        ("ps", "P/S", "num"), ("pb", "P/B", "num"), ("ev", "EV", "money"),
+        ("ev_ebitda", "EV/EBITDA", "num"), ("revenue", "הכנסות TTM", "money"),
+        ("revenue_growth", "צמיחת הכנסות", "pct"), ("earnings_growth", "צמיחת רווחים", "pct"),
+        ("eps", "EPS", "num"), ("forward_eps", "Forward EPS", "num"), ("eps_growth", "צמיחת EPS שנתית", "pct"),
+        ("gross", "רווחיות גולמית", "pct"), ("operating", "רווחיות תפעולית", "pct"),
+        ("profit", "רווחיות נקייה", "pct"), ("ebitda", "EBITDA Margin", "pct"),
+        ("roe", "ROE", "pct"), ("roa", "ROA", "pct"), ("ocf", "תזרים שוטף שנתי", "money"),
+        ("fcf", "תזרים חופשי שנתי", "money"), ("capex", "CAPEX בסימן המקור", "money"),
+        ("cash", "מזומן", "money"), ("debt", "חוב", "money"), ("net_cash", "מזומן פחות חוב", "money"),
+        ("debt_equity", "חוב/הון בפעמים", "num"), ("current_ratio", "יחס שוטף", "num"),
+        ("technical_price", "מחיר בחישוב הטכני", "num"), ("SMA50", "SMA50", "num"),
+        ("SMA150", "SMA150", "num"), ("SMA200", "SMA200", "num"), ("RSI14", "RSI14", "num")]
+    for key, label, kind in fields:
+        lines.append(f"| {label} | {fmt(m[key], kind)} |")
+    for label, key in [("תאריך תזרים שנתי", "cash_date"), ("תאריך מאזן", "balance_date")]:
+        lines.append(f"\n{label}: {model[key].date() if model[key] is not None else NA}")
+    if not model["technical"].empty:
+        lines.append(f"\nתאריך מחיר טכני: {model['technical'].index[-1].date()}")
+    lines.extend(["", "הכנסות ורווחיות בסיכום הן בדרך כלל TTM; צמיחת הכנסות ורווחים מול הרבעון המקביל. תזרים ומאזן שנתיים עשויים להתייחס לתקופה שונה.",
+                  "", "## הכנסות שנתיות", "", "| סיום שנת דיווח | הכנסות |", "|---|---|"])
+    for date, value in model["revenues"].items():
+        lines.append(f"| {date.date()} | {fmt(value, 'money')} |")
+    if model["revenues"].empty:
+        lines.append(f"| — | {NA} |")
+    lines.extend(["", "## תשואות מצטברות", "", "| תקופה | תשואה |", "|---|---|"])
+    for key, value in model["returns"].items():
+        lines.append(f"| {key} | {fmt(value, 'pct')} |")
+    lines.extend(["", "תשואות על בסיס Adj Close המותאם לפיצולים ולדיבידנדים; לא תשואה שנתית ממוצעת. החישובים הטכניים משתמשים ב־Close ללא התאמת דיבידנדים."])
+    for title, texts in zip(["במילים פשוטות", "חוזקות", "נקודות לתשומת לב"], observations(m)):
+        lines.extend(["", f"## {title}", ""] + ["- " + clean(t) for t in texts or ["אין מספיק ממצאים לפי הכללים והנתונים הזמינים."]])
+    if info.get("quoteType") == "EQUITY" and info.get("sector") not in {"Financial Services", "Real Estate"}:
+        results, total, allowance, pe_base, ps_base = score_model(m, model["returns"], info.get("sector"), model["equity"])
+        lines.extend(["", "## ניקוד מחקר", "", f"ציון כולל: {fmt(total)} / 100",
+                      "מודל כללים פנימי שאינו תחזית או המלצה. ציון קטגוריה דורש 60% כיסוי; ציון כולל דורש 75% בכל קטגוריה. המדדים הזמינים שווים במשקלם בתוך הקטגוריה.",
+                      f"בסיס P/E: {pe_base}; בסיס P/S: {ps_base}; מקדם התאמת צמיחה: {allowance:.2f}."])
+        for result in results:
+            lines.extend(["", f"### {result['title']}: {fmt(result['score'])}/20 — כיסוי {result['coverage']:.0%}", "",
+                          "| מדד | ערך | תרומה יחסית 0–100 |", "|---|---|---|"])
+            for label, value, score, kind in result["features"]:
+                lines.append(f"| {label} | {fmt(value, kind)} | {fmt(score * 100) if score is not None else NA} |")
+    else:
+        lines.extend(["", "ניקוד עסקי אינו מוצג לסוג נכס או ענף זה."])
+    lines.extend(["", "K אלפים, M מיליונים, B מיליארדים, T טריליונים. אין המרת מטבע.", "", DISCLAIMER])
+    return "\n".join(lines)
+
+
+def tools_ui(data, model):
+    m, info = model["metrics"], data["info"]
+    currency = info.get("currency") or NA
+    st.markdown("### מה יקרה אם המחיר ישתנה?")
+    st.write("הזז את הסליידר כדי לבדוק איך שינוי במחיר משפיע על המכפילים.")
+    change = st.slider("שינוי במחיר (%)", min_value=-80, max_value=100, value=0, step=5,
+                       key="scenario_" + data["symbol"])
+    scenario = price_scenario(m, change)
+    st.caption("תרחיש חישובי בלבד: הרווח למניה, תחזיות הרווח, ההכנסות, ההון ומספר המניות נשארים קבועים. אין כאן תחזית מחיר או הערכת שווי הוגן.")
+    if scenario["price"] is None:
+        st.info("אין מחיר זמין לחישוב תרחיש.")
+    else:
+        a, b = st.columns(2)
+        a.metric(f"מחיר מקור · {currency}", fmt(m["price"]))
+        b.metric(f"מחיר בתרחיש · {currency}", fmt(scenario["price"]), f"{change:+d}%")
+        rows = [{"מדד": label, "כעת": fmt(m[key]) if scenario[key] is not None else NA,
+                 "בתרחיש": fmt(scenario[key])} for key, label in
+                [("pe", "P/E"), ("forward_pe", "Forward P/E"), ("ps", "Price / Sales"), ("pb", "Price / Book")]]
+        st.dataframe(pd.DataFrame(rows), hide_index=True, width="stretch")
+        if scenario["pe"] is not None:
+            st.write(f"בשינוי של {change:+d}% במחיר, מכפיל הרווח משתנה מ־{fmt(m['pe'])} ל־{fmt(scenario['pe'])}, רק אם הרווח נשאר קבוע.")
+        else:
+            st.caption("אין מכפיל רווח חיובי תקף; לא מוצג תרחיש P/E לחברה הפסדית או כשהנתון חסר.")
+    st.divider()
+    st.markdown("### כמה הייתה שווה השקעה בעבר?")
+    st.caption(f"הסכום במטבע המסחר: {currency}. אין המרה לשקלים או לדולרים אם זה אינו מטבע המסחר.")
+    amount = st.number_input("סכום השקעה התחלתי", min_value=100.0, max_value=100000000.0,
+                             value=1000.0, step=100.0, key="investment_" + data["symbol"])
+    years = st.selectbox("לפני כמה שנים?", [1, 3, 5], index=2, key="years_" + data["symbol"])
+    result = historical_investment(data["history"], years, amount)
+    if result is None:
+        st.info("אין היסטוריה מותאמת מספקת לתקופה שבחרת. אפשר לבחור תקופה קצרה יותר.")
+    else:
+        a, b, c = st.columns(3)
+        a.metric(f"שווי בתאריך האחרון · {currency}", fmt(result["final"]))
+        b.metric(f"רווח / הפסד · {currency}", fmt(result["profit"]), fmt(result["total_return"], "pct"))
+        c.metric("תשואה שנתית ממוצעת מצטברת (CAGR)", fmt(result["annualized"], "pct"))
+        st.caption(f"תאריכי החישוב בפועל: {result['start'].date()} עד {result['end'].date()}. הבסיס הוא יום המסחר האחרון ביום היעד או לפניו, עד 7 ימים קודם.")
+        fig = go.Figure(go.Scatter(x=result["path"].index, y=result["path"].values,
+                                  name="שווי ההשקעה", line=dict(color="#26a69a", width=2)))
+        fig.update_layout(height=320, hovermode="x unified", yaxis_title=currency,
+                          margin=dict(l=20, r=20, t=20, b=20))
+        st.plotly_chart(fig, use_container_width=True)
+    st.caption("הדמיה היסטורית לפי Adj Close עם התאמות לפיצולים ולדיבידנדים, כקירוב להשקעה מחדש. מניחה אפשרות לשברי מניות, ללא מסים, עמלות או שינויי מטבע. ביצועי עבר אינם מבטיחים תשואה עתידית.")
+
+
 def metric_grid(items, columns=4):
     for offset in range(0, len(items), columns):
         for col, item in zip(st.columns(columns), items[offset:offset + columns]):
             label, value, kind, help_text = item
             col.metric(label, fmt(value, kind), help=help_text)
+            explanation = contextual_explanation(label, value)
+            if explanation:
+                col.caption(explanation)
 
 
 def score_ui(m, model, info):
@@ -404,7 +585,13 @@ def render_analysis(data):
     d.metric("P/E · מכפיל רווח", fmt(m["pe"]))
     st.write(f"ענף: {info.get('sector') or NA} | תעשייה: {info.get('industry') or NA}")
     st.caption(f"גבוה 52 שבועות: {fmt(m['high'])} | נמוך 52 שבועות: {fmt(m['low'])}")
-    overview, fundamentals, tech, scoring = st.tabs(["במילים פשוטות", "נתונים פיננסיים", "גרף ותשואות", "ניקוד מחקר"])
+    st.download_button("הורד דוח מחקר", data=export_report(data, model).encode("utf-8"),
+                       file_name=f"{data['symbol']}-report-{data['fetched'][:10]}.md",
+                       mime="text/markdown", on_click="ignore", key="report_" + data["symbol"])
+    st.caption("הורדה כקובץ טקסט מעוצב (Markdown) עם נתונים, הסברים וניקוד. אפשר לפתוח בעורך טקסט; הגרפים והתרחישים אינם כלולים.")
+    overview, fundamentals, tech, scoring, calculators = st.tabs(["במילים פשוטות", "נתונים פיננסיים", "גרף ותשואות", "ניקוד מחקר", "כלים ומחשבונים"])
+    with calculators:
+        tools_ui(data, model)
     with overview:
         simple, strengths, risks = observations(m)
         st.markdown("### במילים פשוטות")
@@ -570,7 +757,7 @@ def main():
     .hero {direction:ltr; text-align:left; margin-bottom:1.6rem; border-bottom:1px solid #25334a; padding-bottom:1.5rem;}
     .hero p {color:#a1b0c3; direction:rtl; text-align:left;}
     </style>''', unsafe_allow_html=True)
-    st.markdown('<div class="hero"><small>RESEARCH WORKSPACE / V1</small><h1>INVESTMENT ANALYZER</h1><p>נתונים. הקשר. הבנה.</p></div>', unsafe_allow_html=True)
+    st.markdown('<div class="hero"><small>RESEARCH WORKSPACE / V1.1</small><h1>INVESTMENT ANALYZER</h1><p>נתונים. הקשר. הבנה.</p></div>', unsafe_allow_html=True)
     st.session_state.setdefault("watchlist", [])
     with st.sidebar:
         st.subheader("רשימת מעקב זמנית")
@@ -590,6 +777,7 @@ def main():
             chosen = st.selectbox("בחר טיקר", st.session_state.watchlist)
             if st.button("נתח מהרשימה", width="stretch"):
                 st.session_state.active_symbol = chosen
+                st.session_state.ticker_input = chosen
             if st.button("הסר מהרשימה", width="stretch"):
                 st.session_state.watchlist.remove(chosen)
                 st.rerun()
@@ -605,8 +793,14 @@ def main():
             st.rerun()
     analysis, compare = st.tabs(["ניתוח מניה", "Compare Stocks · השוואה"])
     with analysis:
+        st.caption("ניתוח מהיר בלחיצה")
+        for column, (label, symbol) in zip(st.columns(5), [("Apple", "AAPL"), ("Nvidia", "NVDA"), ("Tesla", "TSLA"), ("Google", "GOOGL"), ("Amazon", "AMZN")]):
+            if column.button(label, key="quick_" + symbol, width="stretch"):
+                st.session_state.active_symbol = symbol
+                st.session_state.ticker_input = symbol
+        st.session_state.setdefault("ticker_input", st.session_state.get("active_symbol", "TSLA"))
         with st.form("analyzer"):
-            raw = st.text_input("הכנס טיקר של מניה", value="TSLA", placeholder="TSLA / NVDA / AAPL / GOOGL / AMZN")
+            raw = st.text_input("הכנס טיקר של מניה", key="ticker_input", placeholder="TSLA / NVDA / AAPL / GOOGL / AMZN")
             submitted = st.form_submit_button("נתח מניה", type="primary", width="stretch")
         if submitted:
             symbol = normalize_symbol(raw)
